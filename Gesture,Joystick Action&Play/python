@@ -1,0 +1,144 @@
+import cv2
+import mediapipe as mp
+import serial
+import time
+
+# --- CONFIGURATION ---
+SERIAL_PORT = 'COM3'  # <--- CHECK YOUR PORT
+BAUD_RATE = 115200
+WINDOW_NAME = "Robotic Arm Vision"
+
+# --- RATE LIMITING ---
+SEND_DELAY = 0.05
+last_send_time = 0
+
+# Servo Limits
+BASE_MIN, BASE_MAX = 0, 180
+SHLDR_MIN, SHLDR_MAX = 20, 160
+GRIP_OPEN, GRIP_CLOSE = 30, 90
+
+# --- SETUP SERIAL ---
+try:
+    arduino = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE, timeout=.1)
+    time.sleep(2)
+    print(f"Connected to {SERIAL_PORT}")
+except:
+    print(f"WARNING: No Arduino found. Simulation mode.")
+    arduino = None
+
+# --- SETUP MEDIAPIPE ---
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
+mp_draw = mp.solutions.drawing_utils
+
+def map_range(x, in_min, in_max, out_min, out_max):
+    return int((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min)
+
+cap = cv2.VideoCapture(0)
+
+# Fullscreen Setup
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+mode_status = "LIVE CONTROL"
+
+# Display instructions
+print("\n=== ROBOTIC ARM CONTROLS ===")
+print("R - Start Recording")
+print("S - Stop Recording & Save")
+print("P - Play Recording")
+print("E - Erase Recording")
+print("X - Stop/Cancel (return to Live Control)")
+print("Q - Quit Program")
+print("============================\n")
+
+while True:
+    success, img = cap.read()
+    if not success: break
+
+    img = cv2.flip(img, 1)
+    h, w, c = img.shape
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = hands.process(img_rgb)
+
+    if results.multi_hand_landmarks:
+        for hand_lms in results.multi_hand_landmarks:
+            lm_list = []
+            for id, lm in enumerate(hand_lms.landmark):
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                lm_list.append([id, cx, cy])
+
+            if len(lm_list) != 0:
+                # Finger Detection
+                index_up = lm_list[8][2] < lm_list[6][2]
+                middle_up = lm_list[12][2] < lm_list[10][2]
+                ring_up = lm_list[16][2] < lm_list[14][2]
+                pinky_up = lm_list[20][2] < lm_list[18][2]
+
+                if index_up and not middle_up and not ring_up and not pinky_up:
+                    x_pos = hand_lms.landmark[8].x
+                    y_pos = hand_lms.landmark[8].y
+
+                    angle_base = map_range(x_pos, 0, 1, BASE_MIN, BASE_MAX)
+                    angle_shldr = map_range(y_pos, 0, 1, SHLDR_MAX, SHLDR_MIN)
+                    angle_grip = 30
+
+                    # Send with rate limiting
+                    if time.time() - last_send_time > SEND_DELAY:
+                        cmd = f"G,{angle_base},{angle_shldr},{angle_grip}\n"
+                        if arduino:
+                            arduino.write(cmd.encode())
+                        last_send_time = time.time()
+                    
+                    cv2.putText(img, f"Cmd: {angle_base}, {angle_shldr}", (50, 100), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+                    cv2.circle(img, (lm_list[8][1], lm_list[8][2]), 25, (0, 255, 0), cv2.FILLED)
+
+            mp_draw.draw_landmarks(img, hand_lms, mp_hands.HAND_CONNECTIONS)
+
+    # Keyboard Controls
+    key = cv2.waitKey(1) & 0xFF
+    
+    if key == ord('q'): 
+        break
+    elif key == ord('r'):
+        if arduino: 
+            arduino.write(b"rp\n")
+            mode_status = "RECORDING..."
+            print("Started recording")
+    elif key == ord('s'):
+        if arduino: 
+            arduino.write(b"s\n")
+            mode_status = "LIVE CONTROL"
+            print("Recording saved - Live Control")
+    elif key == ord('p'):
+        if arduino: 
+            arduino.write(b"p\n")
+            mode_status = "PLAYING..."
+            print("Playing recording...")
+    elif key == ord('e'):
+        if arduino: 
+            arduino.write(b"e\n")
+            mode_status = "LIVE CONTROL"
+            print("Recording erased - Live Control")
+    elif key == ord('x'):
+        if arduino: 
+            arduino.write(b"x\n")
+            mode_status = "LIVE CONTROL"
+            print("Stopped - Live Control")
+
+    # Display status and controls
+    cv2.putText(img, f"MODE: {mode_status}", (50, 50), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+    
+    # Control hints
+    cv2.putText(img, "R:Rec S:Save P:Play E:Erase X:Stop Q:Quit", (50, h-30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    cv2.imshow(WINDOW_NAME, img)
+
+cap.release()
+cv2.destroyAllWindows()
+if arduino:
+    arduino.close()
+print("Program ended")
