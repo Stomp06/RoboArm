@@ -1,0 +1,219 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+// --- PINS ---
+#define JOY1_X 34   // Base
+#define JOY1_Y 35   // Shoulder (Controls Ch 1 & 2)
+#define JOY2_X 32   // Gripper
+
+// --- SERVO CONFIG ---
+#define SERVO_MIN  150
+#define SERVO_MAX  600
+#define CH_BASE    0
+#define CH_SHLDR_L 4   // Shoulder Left
+#define CH_SHLDR_R 6   // Shoulder Right (Mirrors Left)
+#define CH_GRIP    3
+
+// --- STATE VARIABLES ---
+#define MAX_STEPS 800
+int savedBase[MAX_STEPS], savedShldr[MAX_STEPS], savedGrip[MAX_STEPS];
+int recordedLength = 0;
+bool isRecording = false;
+bool isPlaying = false;
+unsigned long lastStepTime = 0;
+unsigned long lastGestureTime = 0; // Heartbeat for OpenCV
+const int SAMPLE_RATE = 50;
+
+// SMOOTH MOVEMENT VARIABLES
+float posBase = 90, posShldr = 90, posGrip = 30;
+float targetBase = 90, targetShldr = 90, targetGrip = 30;
+float smoothFactor = 0.15; // Lower = slower/smoother (0.05-0.3 recommended)
+
+int angleToPulse(int ang) { return map(ang, 0, 180, SERVO_MIN, SERVO_MAX); }
+
+// --- MIRRORED LOGIC ---
+void setMirroredShoulder(int angle) {
+  pwm.setPWM(CH_SHLDR_L, 0, angleToPulse(angle));
+  pwm.setPWM(CH_SHLDR_R, 0, angleToPulse(180 - angle)); // Inverted for the other side
+}
+
+// --- ACTION STANCE (Default Ready Position) ---
+void actionStance() {
+  Serial.println(">> ACTION STANCE");
+  // Set targets to action position (Middle)
+  targetBase = 90; 
+  targetShldr = 90; 
+  targetGrip = 30;
+  
+  // Smoothly move to action stance
+  for (int i = 0; i < 30; i++) {
+    posBase += (targetBase - posBase) * 0.2;
+    posShldr += (targetShldr - posShldr) * 0.2;
+    posGrip += (targetGrip - posGrip) * 0.2;
+    
+    pwm.setPWM(CH_BASE, 0, angleToPulse((int)posBase));
+    setMirroredShoulder((int)posShldr);
+    pwm.setPWM(CH_GRIP, 0, angleToPulse((int)posGrip));
+    delay(20);
+  }
+  
+  // Ensure we're exactly at action stance
+  // --- FIX APPLIED HERE ---
+  posBase = 90;   // Fixed: Was missing value
+  posShldr = 90; 
+  posGrip = 30;
+  
+  pwm.setPWM(CH_BASE, 0, angleToPulse(90));
+  setMirroredShoulder(90);
+  pwm.setPWM(CH_GRIP, 0, angleToPulse(30));
+}
+
+void setup() {
+  Serial.begin(115200);
+  pwm.begin();
+  pwm.setPWMFreq(60); // Standard servos usually run better at 50-60Hz
+  
+  // Initialize to action stance on startup
+  actionStance();
+  Serial.println("SYSTEM READY - LIVE CONTROL MODE");
+}
+
+void loop() {
+  // 1. CHECK SERIAL COMMANDS & GESTURE DATA
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input == "rp") {
+      // Stop any playback first
+      isPlaying = false;
+      isRecording = true; 
+      recordedLength = 0;
+      actionStance();
+      Serial.println("RECORDING STARTED");
+    }
+    else if (input == "s") {
+      isRecording = false;
+      actionStance();
+      Serial.println("RECORDING STOPPED - LIVE CONTROL");
+    }
+    else if (input == "e") {
+      // ERASE RECORDING
+      isRecording = false;
+      isPlaying = false;
+      recordedLength = 0;
+      memset(savedBase, 0, sizeof(savedBase));
+      memset(savedShldr, 0, sizeof(savedShldr));
+      memset(savedGrip, 0, sizeof(savedGrip));
+      actionStance();
+      Serial.println("RECORDING ERASED - LIVE CONTROL");
+    }
+    else if (input == "p") {
+      if (recordedLength > 0) {
+        isPlaying = true;
+        Serial.println("PLAYING...");
+        for (int i = 0; i < recordedLength && isPlaying; i++) {
+          // Check for stop command during playback
+          if (Serial.available() > 0) {
+            String stopCheck = Serial.readStringUntil('\n');
+            if (stopCheck == "x") {
+              isPlaying = false;
+              break;
+            }
+          }
+          
+          pwm.setPWM(CH_BASE, 0, angleToPulse(savedBase[i]));
+          setMirroredShoulder(savedShldr[i]);
+          pwm.setPWM(CH_GRIP, 0, angleToPulse(savedGrip[i]));
+          delay(SAMPLE_RATE);
+        }
+        isPlaying = false;
+        actionStance();
+        Serial.println("PLAYBACK DONE - LIVE CONTROL");
+      } else {
+        Serial.println("NO RECORDING TO PLAY");
+      }
+    }
+    else if (input == "x") {
+      // STOP/CANCEL - Return to live control
+      isRecording = false;
+      isPlaying = false;
+      actionStance();
+      Serial.println("STOPPED - LIVE CONTROL");
+    }
+    else if (input.startsWith("G")) {
+      lastGestureTime = millis(); // Refresh Heartbeat
+      // Parse gesture data: G,90,90,30
+      int c1 = input.indexOf(',');
+      int c2 = input.indexOf(',', c1 + 1);
+      int c3 = input.indexOf(',', c2 + 1);
+      if (c1 > 0 && c2 > 0) {
+        targetBase = input.substring(c1 + 1, c2).toInt();
+        targetShldr = input.substring(c2 + 1, c3).toInt();
+        targetGrip = input.substring(c3 + 1).toInt();
+      }
+    }
+  }
+
+  // Skip normal control if playing back
+  if (isPlaying) {
+    delay(10);
+    return;
+  }
+
+  // 2. PRIORITY LOGIC: Only use Joysticks if OpenCV is quiet for > 500ms
+  if (millis() - lastGestureTime > 500) {
+    int bVal = analogRead(JOY1_X);
+    int sVal = analogRead(JOY1_Y);
+    int gVal = analogRead(JOY2_X);
+
+    // Base Control
+    if (bVal > 3000) targetBase -= 1.5;
+    if (bVal < 1000) targetBase += 1.5;
+ 
+    // Shoulder Control
+    if (sVal > 3000) targetShldr += 1.5;
+    if (sVal < 1000) targetShldr -= 1.5;
+
+    // Gripper Control
+    if (gVal > 3000) targetGrip += 1.5;
+    if (gVal < 1000) targetGrip -= 1.5;
+  }
+
+  // 3. SMOOTH INTERPOLATION
+  posBase += (targetBase - posBase) * smoothFactor;
+  posShldr += (targetShldr - posShldr) * smoothFactor;
+  posGrip += (targetGrip - posGrip) * smoothFactor;
+
+  // 4. APPLY CONSTRAINTS
+  targetBase = constrain(targetBase, 0, 180);
+  targetShldr = constrain(targetShldr, 20, 160);
+  targetGrip = constrain(targetGrip, 10, 90);
+ 
+  posBase = constrain(posBase, 0, 180);
+  posShldr = constrain(posShldr, 20, 160);
+  posGrip = constrain(posGrip, 10, 90);
+
+  // 5. MOVE SERVOS
+  pwm.setPWM(CH_BASE, 0, angleToPulse((int)posBase));
+  setMirroredShoulder((int)posShldr);
+  pwm.setPWM(CH_GRIP, 0, angleToPulse((int)posGrip));
+
+  // 6. RECORDING ENGINE
+  if (isRecording && millis() - lastStepTime > SAMPLE_RATE) {
+    if (recordedLength < MAX_STEPS) {
+      savedBase[recordedLength] = (int)posBase;
+      savedShldr[recordedLength] = (int)posShldr;
+      savedGrip[recordedLength] = (int)posGrip;
+      recordedLength++;
+    } else {
+      // Auto-stop if buffer is full
+      isRecording = false;
+      Serial.println("BUFFER FULL - RECORDING STOPPED");
+    }
+    lastStepTime = millis();
+  }
+  delay(10);
+}
