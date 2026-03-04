@@ -1,0 +1,131 @@
+import cv2
+import mediapipe as mp
+import serial
+import time
+import math
+
+# --- SERIAL SETUP ---
+SERIAL_PORT = 'COM3' 
+BAUD_RATE = 115200
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
+    time.sleep(2)
+    print("Python Link Established. Safety Logic Active.")
+except Exception as e:
+    print(f"Error: {e}")
+    exit()
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.8)
+mp_draw = mp.solutions.drawing_utils
+
+curr_pos = {0:375, 1:375, 2:435, 3:375, 4:375, 6:400}
+active_motors = {i: False for i in curr_pos.keys()}
+gripper_unlocked = False
+three_finger_timer = 0
+SMOOTHING = 0.2
+
+def map_val(x, in_min, in_max, out_min, out_max):
+    val = (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+    return int(max(min(out_min, out_max), min(max(out_min, out_max), val)))
+
+def get_finger_count(lm):
+    count = 0
+    if lm[8].y < lm[6].y: count += 1   
+    if lm[12].y < lm[10].y: count += 1 
+    if lm[16].y < lm[14].y: count += 1 
+    if lm[20].y < lm[18].y: count += 1 
+    return count
+
+cap = cv2.VideoCapture(0)
+
+while cap.isOpened():
+    if ser.in_waiting > 0:
+        try:
+            line = ser.readline().decode('utf-8').strip()
+            if line == "STOP_CV": break
+        except: pass
+
+    success, frame = cap.read()
+    if not success: break
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb_frame)
+
+    for k in active_motors: active_motors[k] = False
+    targets = curr_pos.copy()
+
+    # HUD Background
+    cv2.rectangle(frame, (10, 10), (280, 200), (40, 40, 40), -1)
+    cv2.putText(frame, "MOTOR STATUS", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    if results.multi_hand_landmarks and results.multi_handedness:
+        for hand_lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            label = handedness.classification[0].label 
+            lm = hand_lms.landmark
+            f_count = get_finger_count(lm)
+            
+            cv2.circle(frame, (int(lm[9].x*w), int(lm[9].y*h)), 8, (0, 255, 0), -1)
+
+            if label == "Right":
+                # --- GRIPPER & ARM EXCLUSIVITY LOGIC ---
+                if f_count == 3:
+                    if not gripper_unlocked:
+                        if three_finger_timer == 0: three_finger_timer = time.time()
+                        elapsed = time.time() - three_finger_timer
+                        cv2.putText(frame, f"LOCKING ARM: {3-elapsed:.1f}s", (int(lm[9].x*w), int(lm[9].y*h)-20), 1, 0.8, (0,255,255), 2)
+                        if elapsed >= 3.0: 
+                            gripper_unlocked = True
+                    
+                    if gripper_unlocked:
+                        # Gripper moves with hand height, Arm (Base/Shldr) is STATIC
+                        targets[3] = map_val(lm[9].y, 0.2, 0.8, 650, 100)
+                        active_motors[3] = True
+                        cv2.putText(frame, "GRIPPER MODE", (int(lm[9].x*w), int(lm[9].y*h)-40), 1, 0.8, (0,255,0), 2)
+                
+                elif f_count == 0:
+                    gripper_unlocked = False
+                    three_finger_timer = 0
+                
+                else:
+                    three_finger_timer = 0
+                    # Arm only moves if gripper is NOT unlocked
+                    if not gripper_unlocked:
+                        targets[4] = map_val(lm[9].y, 0.2, 0.8, 650, 100) # Shldr
+                        targets[0] = map_val(lm[9].x, 0.55, 0.9, 100, 650) # Base
+                        active_motors[4] = active_motors[0] = True
+
+            if label == "Left":
+                # Left hand remains independent
+                targets[6] = map_val(lm[9].y, 0.2, 0.8, 650, 100) 
+                targets[1] = map_val(lm[9].x, 0.1, 0.45, 100, 650) 
+                p_dist = math.hypot(lm[20].x - lm[4].x, lm[20].y - lm[4].y)
+                targets[2] = map_val(p_dist, 0.05, 0.25, 335, 565) 
+                active_motors[6] = active_motors[1] = active_motors[2] = True
+
+            mp_draw.draw_landmarks(frame, hand_lms, mp_hands.HAND_CONNECTIONS)
+
+    # UI and Serial Send
+    names = {0:"Base", 4:"Shldr", 3:"Grip", 6:"Aux", 1:"Roll", 2:"Pitch"}
+    for i, (mid, name) in enumerate(names.items()):
+        color = (0, 255, 0) if active_motors[mid] else (0, 0, 255)
+        # Indicate locked state in HUD
+        locked_text = " (LOCKED)" if (mid in [0, 4] and gripper_unlocked) else ""
+        cv2.putText(frame, f"{name}: {curr_pos[mid]}{locked_text}", (20, 55 + i*20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    for id in curr_pos.keys():
+        diff = targets[id] - curr_pos[id]
+        if abs(diff) > 1:
+            curr_pos[id] += int(diff * SMOOTHING)
+            ser.write(f"{id},{curr_pos[id]}\n".encode())
+        time.sleep(0.001)
+
+    cv2.imshow("Robot Command Center", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        ser.write(b"EXIT\n")
+        break
+
+cap.release()
+ser.close()
+cv2.destroyAllWindows()
